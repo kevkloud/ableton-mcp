@@ -286,7 +286,9 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_session_info()
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
-                response["result"] = self._get_track_info(track_index)
+                include_clip_slots = params.get("include_clip_slots", True)
+                response["result"] = self._get_track_info(
+                    track_index, include_clip_slots)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "create_audio_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
@@ -566,8 +568,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting session info: " + str(e))
             raise
     
-    def _get_track_info(self, track_index):
-        """Get information about a track"""
+    def _get_track_info(self, track_index, include_clip_slots=True):
+        """Get information about a track.
+
+        include_clip_slots defaults to True so the response shape is
+        unchanged for existing callers. Passing False replaces the per-slot
+        array -- eight near-identical objects on a track whose slots are all
+        empty, which is most tracks -- with a count and the list of occupied
+        slot indices. The information is the same; a caller that only wants
+        to know whether anything is there stops paying for the rest.
+        """
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
@@ -613,9 +623,15 @@ class AbletonMCP(ControlSurface):
                 "arm": self._safe_arm(track),
                 "volume": track.mixer_device.volume.value,
                 "panning": track.mixer_device.panning.value,
-                "clip_slots": clip_slots,
                 "devices": devices
             }
+            if include_clip_slots:
+                result["clip_slots"] = clip_slots
+            else:
+                result["clip_slot_count"] = len(clip_slots)
+                result["occupied_slots"] = [
+                    s["index"] for s in clip_slots if s["has_clip"]
+                ]
             return result
         except Exception as e:
             self.log_message("Error getting track info: " + str(e))

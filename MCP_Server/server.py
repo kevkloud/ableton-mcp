@@ -457,17 +457,24 @@ def get_remote_script_info(ctx: Context, user_prompt: str = "") -> str:
 @mcp.tool()
 @telemetry_tool("get_track_info")
 @trajectory_tool("get_track_info")
-def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+def get_track_info(ctx: Context, track_index: int, include_clip_slots: bool = True, user_prompt: str = "") -> str:
     """
     Get detailed information about a specific track in Ableton.
 
     Parameters:
     - track_index: The index of the track to get information about
+    - include_clip_slots: Return the full per-slot array (default). Pass False
+      for a much smaller response carrying the same information: a slot count
+      plus the indices of the occupied slots. Prefer False when you only need
+      to know which slots hold clips, which is the usual case.
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_track_info", {"track_index": track_index})
+        result = ableton.send_command("get_track_info", {
+            "track_index": track_index,
+            "include_clip_slots": include_clip_slots,
+        })
         return json.dumps(result, indent=2)
     except Exception as e:
         logger.error(f"Error getting track info from Ableton: {str(e)}")
