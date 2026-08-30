@@ -991,6 +991,42 @@ def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: st
 
 
 @mcp.tool()
+@telemetry_tool("delete_track")
+def delete_track(ctx: Context, track_index: int, recursive: bool = False, user_prompt: str = "") -> str:
+    """
+    Delete a track from the Ableton session.
+
+    Deleting a group track also deletes every track inside it. Because that
+    cannot be undone from here, a group that still holds tracks is refused
+    unless recursive is set to True; the refusal lists what would have gone.
+
+    Deleting shifts the indices of all later tracks down. When removing
+    several tracks, work in descending index order, or re-read the track list
+    between calls.
+
+    Parameters:
+    - track_index: The index of the track to delete
+    - recursive: Set True to confirm deleting a group and all tracks inside it
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("delete_track")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("delete_track", {
+            "track_index": track_index,
+            "recursive": recursive,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error deleting track: {str(e)}")
+        return f"Error deleting track: {str(e)}"
+
+
+@mcp.tool()
 @telemetry_tool("start_playback")
 @trajectory_tool("start_playback")
 def start_playback(ctx: Context, user_prompt: str = "") -> str:
