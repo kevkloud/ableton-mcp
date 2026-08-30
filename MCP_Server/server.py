@@ -1041,6 +1041,50 @@ def delete_track(ctx: Context, track_index: int, recursive: bool = False, user_p
 
 
 @mcp.tool()
+@telemetry_tool("batch")
+def batch(ctx: Context, operations: List[Dict[str, Any]], user_prompt: str = "") -> str:
+    """
+    Run several write operations in a single round trip.
+
+    Each ordinary command costs its own scheduler tick inside Live, so N
+    separate calls cost N ticks even when the work is trivial. A batch runs
+    them all in one main-thread visit, which is the difference between a
+    16-bar multi-track pattern taking seconds and taking a fraction of one.
+    Prefer this whenever you have more than two writes to make.
+
+    Reads are not accepted -- use get_session_snapshot to fetch in bulk.
+
+    Every operation runs even if an earlier one fails. The response contains
+    one entry per operation, each marked ok with its result or carrying its
+    error, plus counts, so a partial batch is unambiguous.
+
+    delete_track operations are executed in descending index order regardless
+    of the order given, because deleting a track shifts every later index
+    down. When that reordering happens the response says so.
+
+    Supported: create_midi_track, create_audio_track, set_track_name,
+    create_clip, delete_clip, add_notes_to_clip, clear_notes_from_clip,
+    set_clip_name, set_tempo, delete_track.
+
+    Parameters:
+    - operations: List of {"type": <command>, "params": {...}} objects
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        from .script_handshake import require_capability
+
+        missing = require_capability("batch")
+        if missing:
+            return missing
+        ableton = get_ableton_connection()
+        result = ableton.send_command("batch", {"operations": operations})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error running batch: {str(e)}")
+        return f"Error running batch: {str(e)}"
+
+
+@mcp.tool()
 @telemetry_tool("start_playback")
 @trajectory_tool("start_playback")
 def start_playback(ctx: Context, user_prompt: str = "") -> str:

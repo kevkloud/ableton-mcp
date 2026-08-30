@@ -21,7 +21,7 @@ HOST = "0.0.0.0"
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.8.0"
+SCRIPT_VERSION = "1.9.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -44,6 +44,7 @@ SCRIPT_CAPABILITIES = [
     "create_locator",
     "delete_clip",
     "delete_track",
+    "batch",
     "clear_notes_from_clip",
 ]
 
@@ -293,7 +294,7 @@ class AbletonMCP(ControlSurface):
             elif command_type in ["create_midi_track", "create_audio_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_arrangement_clip_name",
-                                 "delete_clip", "delete_track",
+                                 "delete_clip", "delete_track", "batch",
                                  "clear_notes_from_clip",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback",
@@ -368,6 +369,8 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             recursive = bool(params.get("recursive", False))
                             result = self._delete_track(track_index, recursive)
+                        elif command_type == "batch":
+                            result = self._batch(params.get("operations", []))
                         elif command_type == "start_playback":
                             result = self._start_playback()
                         elif command_type == "stop_playback":
@@ -1069,6 +1072,144 @@ class AbletonMCP(ControlSurface):
             }
         except Exception as e:
             self.log_message("Error deleting track: " + str(e))
+            raise
+
+    # Write commands that _batch can execute. Reads are deliberately absent:
+    # they are not what batching is for (get_session_snapshot already fetches
+    # in bulk) and mixing them in would make ordering harder to reason about.
+    BATCH_OPS = (
+        "create_midi_track",
+        "create_audio_track",
+        "set_track_name",
+        "create_clip",
+        "delete_clip",
+        "add_notes_to_clip",
+        "clear_notes_from_clip",
+        "set_clip_name",
+        "set_tempo",
+        "delete_track",
+    )
+
+    def _run_batch_op(self, op_type, params):
+        """Execute one write operation by name. Raises on unknown type."""
+        if op_type == "create_midi_track":
+            return self._create_midi_track(params.get("index", -1))
+        if op_type == "create_audio_track":
+            return self._create_audio_track(params.get("index", -1))
+        if op_type == "set_track_name":
+            return self._set_track_name(
+                params.get("track_index", 0), params.get("name", ""))
+        if op_type == "create_clip":
+            return self._create_clip(
+                params.get("track_index", 0), params.get("clip_index", 0),
+                params.get("length", 4.0))
+        if op_type == "delete_clip":
+            return self._delete_clip(
+                params.get("track_index", 0), params.get("clip_index", 0))
+        if op_type == "add_notes_to_clip":
+            return self._add_notes_to_clip(
+                params.get("track_index", 0), params.get("clip_index", 0),
+                params.get("notes", []))
+        if op_type == "clear_notes_from_clip":
+            return self._clear_notes_from_clip(
+                params.get("track_index", 0), params.get("clip_index", 0))
+        if op_type == "set_clip_name":
+            return self._set_clip_name(
+                params.get("track_index", 0), params.get("clip_index", 0),
+                params.get("name", ""))
+        if op_type == "set_tempo":
+            return self._set_tempo(params.get("tempo", 120.0))
+        if op_type == "delete_track":
+            return self._delete_track(
+                params.get("track_index", 0),
+                bool(params.get("recursive", False)))
+        raise ValueError("Operation not supported in batch: " + str(op_type))
+
+    def _order_batch(self, operations):
+        """Return operations with delete_track ordered by descending index.
+
+        Deleting a track shifts every later index down, so a caller who lists
+        deletes in ascending order silently removes the wrong tracks after the
+        first one. Only the deletes move, and only relative to each other:
+        each keeps its position in the sequence, so a delete never crosses a
+        non-delete operation and the rest of the batch runs in the order it
+        was written.
+        """
+        slots = [i for i, op in enumerate(operations)
+                 if op.get("type") == "delete_track"]
+        if len(slots) < 2:
+            return list(operations), False
+        deletes = sorted(
+            (operations[i] for i in slots),
+            key=lambda op: op.get("params", {}).get("track_index", 0),
+            reverse=True)
+        ordered = list(operations)
+        reordered = False
+        for slot, op in zip(slots, deletes):
+            if ordered[slot] is not op:
+                reordered = True
+            ordered[slot] = op
+        return ordered, reordered
+
+    def _batch(self, operations):
+        """Run several write operations inside a single main-thread visit.
+
+        The point is round trips, not raw speed. Each command normally costs
+        its own scheduler tick, so N operations cost N ticks even though the
+        work itself is trivial; running them together costs one.
+
+        Execution continues after a failing operation. The result is one entry
+        per operation, in the order given, each marked ok or carrying its
+        error, so a partial batch is fully legible rather than ambiguous.
+        """
+        try:
+            if not isinstance(operations, list):
+                raise ValueError("operations must be a list")
+
+            unsupported = sorted(set(
+                str(op.get("type")) for op in operations
+                if op.get("type") not in self.BATCH_OPS))
+            if unsupported:
+                raise ValueError(
+                    "Unsupported operation(s) in batch: %s. Supported: %s"
+                    % (", ".join(unsupported), ", ".join(self.BATCH_OPS)))
+
+            ordered, reordered = self._order_batch(operations)
+
+            results = []
+            succeeded = 0
+            failed = 0
+            for op in ordered:
+                op_type = op.get("type")
+                try:
+                    value = self._run_batch_op(op_type, op.get("params", {}))
+                    results.append({"type": op_type, "ok": True, "result": value})
+                    succeeded += 1
+                except Exception as op_error:
+                    self.log_message(
+                        "Batch op failed (%s): %s" % (op_type, str(op_error)))
+                    results.append({
+                        "type": op_type,
+                        "ok": False,
+                        "error": str(op_error),
+                    })
+                    failed += 1
+
+            out = {
+                "count": len(results),
+                "succeeded": succeeded,
+                "failed": failed,
+                "results": results,
+            }
+            if reordered:
+                out["note"] = (
+                    "delete_track operations were run in descending index "
+                    "order so earlier deletions could not invalidate later "
+                    "indices. Results are listed in that execution order."
+                )
+            return out
+        except Exception as e:
+            self.log_message("Error running batch: " + str(e))
             raise
 
     def _start_playback(self):
