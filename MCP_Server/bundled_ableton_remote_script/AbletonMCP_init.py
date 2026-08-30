@@ -21,7 +21,7 @@ HOST = "0.0.0.0"
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.0"
+SCRIPT_VERSION = "1.8.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -43,6 +43,7 @@ SCRIPT_CAPABILITIES = [
     "duplicate_session_clip_to_arrangement",
     "create_locator",
     "delete_clip",
+    "delete_track",
     "clear_notes_from_clip",
 ]
 
@@ -282,7 +283,7 @@ class AbletonMCP(ControlSurface):
             elif command_type in ["create_midi_track", "create_audio_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
                                  "set_arrangement_clip_name",
-                                 "delete_clip",
+                                 "delete_clip", "delete_track",
                                  "clear_notes_from_clip",
                                  "set_tempo", "fire_clip", "stop_clip",
                                  "start_playback", "stop_playback",
@@ -353,6 +354,10 @@ class AbletonMCP(ControlSurface):
                             track_index = params.get("track_index", 0)
                             clip_index = params.get("clip_index", 0)
                             result = self._delete_clip(track_index, clip_index)
+                        elif command_type == "delete_track":
+                            track_index = params.get("track_index", 0)
+                            recursive = bool(params.get("recursive", False))
+                            result = self._delete_track(track_index, recursive)
                         elif command_type == "start_playback":
                             result = self._start_playback()
                         elif command_type == "stop_playback":
@@ -921,6 +926,106 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error deleting clip: " + str(e))
             raise
 
+
+    def _group_children(self, group_index):
+        """Return the indices of every track nested inside the group at group_index.
+
+        Live keeps a group's members contiguous and immediately after it, so
+        walking forward until the first track that is not a descendant covers
+        the whole group, nested subgroups included.
+        """
+        song = self._song
+        group = song.tracks[group_index]
+        children = []
+        for i in range(group_index + 1, len(song.tracks)):
+            parent = getattr(song.tracks[i], "group_track", None)
+            descends = False
+            while parent is not None:
+                if parent == group:
+                    descends = True
+                    break
+                parent = getattr(parent, "group_track", None)
+            if not descends:
+                break
+            children.append(i)
+        return children
+
+    def _describe_track(self, track_index):
+        """Small summary of a track, recorded before deleting it.
+
+        Deleting a track is not undoable through this API, so the caller gets
+        back a description of exactly what went away.
+        """
+        track = self._song.tracks[track_index]
+        session_clips = 0
+        for slot in track.clip_slots:
+            if slot.has_clip:
+                session_clips += 1
+        arrangement_clips = 0
+        try:
+            arrangement_clips = len(track.arrangement_clips)
+        except Exception:
+            pass
+        return {
+            "index": track_index,
+            "name": track.name,
+            "is_group": bool(getattr(track, "is_foldable", False)),
+            "is_midi_track": bool(track.has_midi_input),
+            "session_clips": session_clips,
+            "arrangement_clips": arrangement_clips,
+            "devices": [d.name for d in track.devices],
+        }
+
+    def _delete_track(self, track_index, recursive=False):
+        """Delete a track. Deleting a group deletes everything inside it.
+
+        Live removes a group's members along with the group, which is not
+        recoverable through this API, so a group holding tracks is refused
+        unless the caller explicitly passes recursive.
+        """
+        try:
+            if track_index < 0 or track_index >= len(self._song.tracks):
+                raise IndexError("Track index out of range")
+
+            track = self._song.tracks[track_index]
+            is_group = bool(getattr(track, "is_foldable", False))
+            children = self._group_children(track_index) if is_group else []
+
+            if children and not recursive:
+                return {
+                    "deleted": False,
+                    "reason": (
+                        "Track %d (%s) is a group containing %d track(s). "
+                        "Deleting it removes them too, and this cannot be "
+                        "undone through the API. Pass recursive=true to "
+                        "confirm, or delete the child tracks first."
+                        % (track_index, track.name, len(children))
+                    ),
+                    "is_group": True,
+                    "would_also_delete": [
+                        self._describe_track(i) for i in children
+                    ],
+                }
+
+            removed = [self._describe_track(i) for i in [track_index] + children]
+
+            self._song.delete_track(track_index)
+
+            return {
+                "deleted": True,
+                "removed": removed,
+                "removed_count": len(removed),
+                "remaining_track_count": len(self._song.tracks),
+                "note": (
+                    "Track indices at or after %d have shifted down by %d. "
+                    "Re-read the track list before deleting again, or delete "
+                    "in descending index order."
+                    % (track_index, len(removed))
+                ),
+            }
+        except Exception as e:
+            self.log_message("Error deleting track: " + str(e))
+            raise
 
     def _start_playback(self):
         """Start playing the session"""
