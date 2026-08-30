@@ -43,6 +43,13 @@ class AbletonConnection:
             self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
             self.sock.settimeout(None)
+            try:
+                # Small request, small response, one at a time -- exactly the
+                # traffic Nagle delays. Set on both ends; each only controls
+                # its own sends.
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             logger.info(f"Connected to Ableton at {self.host}:{self.port}")
             return True
         except Exception as e:

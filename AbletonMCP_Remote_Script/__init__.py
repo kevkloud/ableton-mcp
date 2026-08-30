@@ -154,7 +154,6 @@ class AbletonMCP(ControlSurface):
                     # Accept connections with timeout
                     client, address = self.server.accept()
                     self.log_message("Connection accepted from " + str(address))
-                    self.show_message("AbletonMCP: Client connected")
                     
                     # Handle client in a separate thread
                     client_thread = threading.Thread(
@@ -186,6 +185,15 @@ class AbletonMCP(ControlSurface):
         """Handle communication with a connected client"""
         self.log_message("Client handler started")
         client.settimeout(None)  # No timeout for client socket
+        try:
+            # Every exchange is a small request followed by a small response,
+            # which is the pattern Nagle's algorithm penalises: a reply can sit
+            # in the send buffer waiting for an ACK that the peer is delaying
+            # because it has nothing to send back.
+            client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            # Not fatal -- the connection still works, just less promptly.
+            pass
         buffer = ''  # Changed from b'' to '' for Python 2
         
         try:
